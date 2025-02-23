@@ -430,7 +430,7 @@ async def webhook(request: Request):
                         new_delay = 30  # Shorter delay for re-scheduling (e.g., 30 seconds)
                         new_task = send_dm.apply_async(
                             args=(conversation_id, message_queue.copy()),  # Re-schedule with updated queue
-                            countdown=new_delay, expires=new_delay + 60
+                            countdown=new_delay, expires=new_delay + 600
                         )
                         conversation_task_schedules[conversation_id] = new_task.id  # Track new task ID
                         logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message)")
