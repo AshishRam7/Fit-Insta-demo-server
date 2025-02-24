@@ -13,3 +13,4 @@ asyncpg==0.29.0
 sse-starlette
 pydantic==2.5.3
 python-multipart==0.0.6    
+psycopg2-binary==2.9.9
