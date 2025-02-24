@@ -129,6 +129,7 @@ def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_us
         # Send the combined response
         try:
             access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
+            logger.info(f"Token fetched: {access_token_to_use}")
             result = postmsg(access_token_to_use, recipient_id, response_text) # MODIFIED: Use dynamic access token
             logger.info(f"Sent combined response to {recipient_id} using account {account_id_to_use}. Result: {result}")
         except Exception as e:
