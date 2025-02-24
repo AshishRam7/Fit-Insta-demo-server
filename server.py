@@ -108,7 +108,7 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
             llm_prompt_suffix = "Respond in a helpful and neutral tone. Keep it concise and informative."
 
         system_prompt_content = ""
-        with open("system_prompt.txt", "r") as file:
+        with open("collection_system_prompt/system_prompt.txt", "r") as file:
             system_prompt_content = file.read().strip()
         full_prompt = system_prompt_content + " Message/Conversation input from user: " + combined_text + " "
 
@@ -508,3 +508,4 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
