@@ -497,6 +497,10 @@ async def get_webhook_events():
     """Retrieve all stored webhook events."""
     return {"events": list(WEBHOOK_EVENTS)}
 
+@app.get("/accounts") # New GET endpoint to retrieve account credentials
+async def get_account_credentials():
+    """Retrieve all stored account credentials."""
+    return {"accounts": ACCOUNT_CREDENTIALS}
 
 async def event_generator(request: Request):
     """Generate Server-Sent Events."""
