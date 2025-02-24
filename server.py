@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Request, Response, HTTPException, Query
+from fastapi import FastAPI, Request, Response, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from typing import List
+from typing import List, Dict
+from pydantic import BaseModel
 import hashlib
 import hmac
 import json
@@ -54,8 +55,6 @@ CLIENTS: List[asyncio.Queue] = []
 # Webhook Credentials
 APP_SECRET = os.getenv("APP_SECRET")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN")
-account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")  # Replace
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 model_name = "gemini-1.5-flash"
 
@@ -69,6 +68,10 @@ WEBHOOK_FILE = "webhook_events.json"
 # --- MODIFICATION: In-Memory Broker and Backend ---
 CELERY_BROKER_URL = 'memory://'
 CELERY_RESULT_BACKEND = 'cache+memory://'
+# -------------------------------------------------
+
+# --- MODIFICATION: Local Storage for Account Credentials ---
+ACCOUNT_CREDENTIALS: Dict[str, str] = {}  # Store account_id: access_token
 # -------------------------------------------------
 
 
@@ -86,7 +89,7 @@ conversation_task_schedules = {}  # Track scheduled task IDs per conversation
 
 
 @celery.task(name="send_dm")
-def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass conversation_id and snapshot
+def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_use):  # Added account_id_to_use
     """Celery task to process and respond to a conversation's messages."""
     try:
         if conversation_id_to_process not in message_queue_snapshot or not message_queue_snapshot[conversation_id_to_process]:
@@ -125,10 +128,11 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
 
         # Send the combined response
         try:
-            result = postmsg(access_token, recipient_id, response_text)
-            logger.info(f"Sent combined response to {recipient_id}. Result: {result}")
+            access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
+            result = postmsg(access_token_to_use, recipient_id, response_text) # MODIFIED: Use dynamic access token
+            logger.info(f"Sent combined response to {recipient_id} using account {account_id_to_use}. Result: {result}")
         except Exception as e:
-            logger.error(f"Error sending message to {recipient_id}: {e}")
+            logger.error(f"Error sending message to {recipient_id} using account {account_id_to_use}: {e}")
 
         # Clear ONLY for the processed conversation ID (after processing is successful)
         if conversation_id_to_process in message_queue:  # Double check before deleting (race condition safety)
@@ -149,14 +153,15 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
 
 
 @celery.task(name="send_delayed_reply")
-def send_delayed_reply(access_token, comment_id, message_to_be_sent):
+def send_delayed_reply(comment_id, message_to_be_sent, account_id_to_use): # Added account_id_to_use
     """Sends a delayed reply to a comment."""
     try:
-        result = sendreply(access_token, comment_id, message_to_be_sent)
-        logger.info(f"Reply sent to comment {comment_id}. Result: {result}")
+        access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
+        result = sendreply(access_token_to_use, comment_id, message_to_be_sent) # MODIFIED: Use dynamic access token
+        logger.info(f"Reply sent to comment {comment_id} using account {account_id_to_use}. Result: {result}")
         return result
     except Exception as e:
-        logger.error(f"Error sending reply to comment {comment_id}: {e}")
+        logger.error(f"Error sending reply to comment {comment_id} using account {account_id_to_use}: {e}")
         raise  # Important: Re-raise for Celery retry handling.
 
 
@@ -175,6 +180,14 @@ def load_events_from_file():
                 WEBHOOK_EVENTS.extend(events)
         except Exception as e:
             logger.error(f"Failed to load events from file: {e}")
+
+def get_access_token_for_account(account_id):
+    """Retrieve access token for a given account ID from local storage."""
+    access_token = ACCOUNT_CREDENTIALS.get(account_id)
+    if not access_token:
+        logger.error(f"No access token found for account ID: {account_id}")
+        raise ValueError(f"No access token found for account ID: {account_id}") # Or handle as needed
+    return access_token
 
 
 def llm_response(api_key, model_name, query):
@@ -379,6 +392,17 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+class AccountCredentials(BaseModel):
+    account_id: str
+    access_token: str
+
+@app.post("/accounts")
+async def add_account_credentials(creds: AccountCredentials):
+    """Add or update account credentials."""
+    ACCOUNT_CREDENTIALS[creds.account_id] = creds.access_token
+    logger.info(f"Account credentials added/updated for account ID: {creds.account_id}")
+    return {"message": "Account credentials saved successfully"}
+
 @app.post("/webhook")
 async def webhook(request: Request):
     """Handle incoming webhook events from Meta."""
@@ -404,17 +428,18 @@ async def webhook(request: Request):
             # Handle different types of events
             if event["type"] == "direct_message" and event["is_echo"] == False:
                 conversation_id = str(event["sender_id"]) + "_" + str(event["recipient_id"])
+                account_id_to_use = str(event["recipient_id"]) # MODIFIED: Use recipient_id as account_id
 
                 if conversation_id not in message_queue:
                     # New conversation
                     message_queue[conversation_id] = [event]
                     delay = random.randint(1 * 60, 2 * 60)  # Initial delay (1-2 minutes)
                     task = send_dm.apply_async(
-                        args=(conversation_id, message_queue.copy()),  # Pass conversation_id and snapshot
+                        args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
                         countdown=delay, expires=delay + 60
                     )
                     conversation_task_schedules[conversation_id] = task.id  # Track scheduled task ID
-                    logger.info(f"Scheduled initial DM task for new conversation: {conversation_id}, task_id: {task.id}, delay: {delay}s")
+                    logger.info(f"Scheduled initial DM task for new conversation: {conversation_id}, task_id: {task.id}, delay: {delay}s, account_id: {account_id_to_use}")
 
                 else:
                     # Existing conversation - add new message and re-schedule
@@ -429,11 +454,11 @@ async def webhook(request: Request):
 
                         new_delay = 30  # Shorter delay for re-scheduling (e.g., 30 seconds)
                         new_task = send_dm.apply_async(
-                            args=(conversation_id, message_queue.copy()),  # Re-schedule with updated queue
+                            args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
                             countdown=new_delay, expires=new_delay + 600
                         )
                         conversation_task_schedules[conversation_id] = new_task.id  # Track new task ID
-                        logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message)")
+                        logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message), account_id: {account_id_to_use}")
 
 
             elif event["type"] == "comment" and event["from_id"] != account_id:
@@ -444,13 +469,14 @@ async def webhook(request: Request):
                 else:
                     message_to_be_sent = default_comment_response_negative
 
+                account_id_to_use = os.getenv("INSTAGRAM_ACCOUNT_ID") # Default account ID for comments, can be adjusted as needed
                 # Schedule the reply task
                 delay = random.randint(1 * 60, 2 * 60)  # 10 to 25 minutes in seconds
                 send_delayed_reply.apply_async(
-                    args=(access_token, event["comment_id"], message_to_be_sent),
+                    args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
                     countdown=delay, expires=delay + 60
                 )
-                logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds")
+                logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
 
         # Store event and notify clients
         WEBHOOK_EVENTS.append(event_with_time)
@@ -502,7 +528,6 @@ async def events(request: Request):
 
 # Serve static HTML
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 
 
 if __name__ == "__main__":
