@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import httpx  # Using httpx for async requests
 from nltk.sentiment import SentimentIntensityAnalyzer
 import nltk
+import psycopg2
 
 from celery import Celery
 import random
