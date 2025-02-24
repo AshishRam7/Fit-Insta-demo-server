@@ -184,7 +184,7 @@ def load_events_from_file():
 
 def get_access_token_for_account(account_id):
     """Retrieve access token for a given account ID from local storage."""
-    access_token = ACCOUNT_CREDENTIALS.get(account_id)
+    access_token = ACCOUNT_CREDENTIALS["account_id"]
     if not access_token:
         logger.error(f"No access token found for account ID: {account_id}")
         raise ValueError(f"No access token found for account ID: {account_id}") # Or handle as needed
