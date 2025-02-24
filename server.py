@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Request, Response, HTTPException, Query
+from fastapi import FastAPI, Request, Response, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from typing import List
+from typing import List, Dict
 import hashlib
 import hmac
 import json
@@ -15,24 +15,31 @@ import psutil
 import time
 import os
 from dotenv import load_dotenv
-import requests
+import httpx  # Using httpx for async requests
 from nltk.sentiment import SentimentIntensityAnalyzer
 import nltk
 
 from celery import Celery
 import random
 
+# Database imports
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+# Download required data (only once)
 nltk.download('vader_lexicon')
 
 load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+
 # Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="Meta Webhook Server")
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,18 +51,15 @@ app.add_middleware(
 
 START_TIME = time.time()
 
-
 # Store webhook events - using deque with max size to prevent memory issues
 WEBHOOK_EVENTS = deque(maxlen=100)
 
 # Store SSE clients
 CLIENTS: List[asyncio.Queue] = []
 
-# Webhook Credentials
-APP_SECRET = os.getenv("APP_SECRET")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN")
-account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")  # Replace
+# Webhook Credentials - APP_SECRET and VERIFY_TOKEN from environment
+APP_SECRET = os.getenv("APP_SECRET", "d928c83e7f4c38a67017f44887b55668") # Default for safety if not set
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "fitvideodemo") # Default for safety if not set
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 model_name = "gemini-1.5-flash"
 
@@ -71,7 +75,6 @@ CELERY_BROKER_URL = 'memory://'
 CELERY_RESULT_BACKEND = 'cache+memory://'
 # -------------------------------------------------
 
-
 celery = Celery(__name__, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
 celery.conf.update(
     task_serializer='json',
@@ -81,9 +84,54 @@ celery.conf.update(
     enable_utc=True,
 )
 
-message_queue = {}  # Store messages per conversation_id
-conversation_task_schedules = {}  # Track scheduled task IDs per conversation
+message_queue: Dict[str, List[Dict]] = {}  # Store messages per conversation_id
+conversation_task_schedules: Dict[str, str] = {}  # Track scheduled task IDs per conversation
 
+# --- Database Configuration ---
+DATABASE_URL = os.getenv("DATABASE_URL")  # Get database URL from Render environment
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://user:password@localhost:5432/mydatabase" # Fallback for local testing
+
+engine = create_async_engine(DATABASE_URL, echo=False) # Set echo=True for debugging SQL queries
+AsyncSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
+
+Base = declarative_base()
+
+class InstagramAccount(Base):
+    __tablename__ = "instagram_accounts"
+
+    account_id = Column(String, primary_key=True, index=True)
+    access_token = Column(String)
+
+async def create_db_and_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+@app.on_event("startup")
+async def startup_event():
+    await create_db_and_tables()
+
+async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as db:
+        yield db
+
+# --- API Endpoints ---
+
+class AccountCreate(BaseModel): # Import from pydantic
+    account_id: str
+    access_token: str
+
+from pydantic import BaseModel
+
+@app.post("/accounts/", response_model=AccountCreate)
+async def create_account(account: AccountCreate, db: AsyncSession = Depends(get_db)):
+    db_account = InstagramAccount(**account.dict())
+    db.add(db_account)
+    await db.commit()
+    await db.refresh(db_account)
+    return db_account
+
+# --- Celery Tasks ---
 
 @celery.task(name="send_dm")
 def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass conversation_id and snapshot
@@ -94,7 +142,8 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
             return {"status": "no_messages_to_process", "conversation_id": conversation_id_to_process}
 
         messages = message_queue_snapshot[conversation_id_to_process]  # Use the snapshot
-        recipient_id = messages[0]["sender_id"]
+        recipient_id = messages[0]["recipient_id"] # Corrected to recipient_id as we need bot's account_id
+        sender_id = messages[0]["sender_id"]
         combined_text = "\n".join([msg["text"] for msg in messages])
 
         sentiment = analyze_sentiment(combined_text) # Analyze sentiment BEFORE LLM call
@@ -112,6 +161,18 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
             system_prompt_content = file.read().strip()
         full_prompt = system_prompt_content + " Message/Conversation input from user: " + combined_text + " "
 
+        async def get_access_token_async(account_id_):
+            async with AsyncSessionLocal() as db:
+                account = await db.get(InstagramAccount, account_id_)
+                if account:
+                    return account.access_token
+                return None
+
+        access_token_for_account = asyncio.run(get_access_token_async(recipient_id)) #Recipient ID is bot's account ID
+
+        if not access_token_for_account:
+            logger.error(f"Access token not found for account ID: {recipient_id}")
+            return {"status": "error", "message": "Access token not found"}
 
         # Generate response using LLM
         try:
@@ -125,10 +186,10 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
 
         # Send the combined response
         try:
-            result = postmsg(access_token, recipient_id, response_text)
-            logger.info(f"Sent combined response to {recipient_id}. Result: {result}")
+            result = asyncio.run(postmsg(access_token_for_account, sender_id, response_text)) # Sender ID is user's ID
+            logger.info(f"Sent combined response to {sender_id}. Result: {result}")
         except Exception as e:
-            logger.error(f"Error sending message to {recipient_id}: {e}")
+            logger.error(f"Error sending message to {sender_id}: {e}")
 
         # Clear ONLY for the processed conversation ID (after processing is successful)
         if conversation_id_to_process in message_queue:  # Double check before deleting (race condition safety)
@@ -149,10 +210,23 @@ def send_dm(conversation_id_to_process, message_queue_snapshot):  # Pass convers
 
 
 @celery.task(name="send_delayed_reply")
-def send_delayed_reply(access_token, comment_id, message_to_be_sent):
+def send_delayed_reply(comment_id, message_to_be_sent, recipient_account_id): # Added recipient_account_id
     """Sends a delayed reply to a comment."""
     try:
-        result = sendreply(access_token, comment_id, message_to_be_sent)
+        async def get_access_token_async(account_id_):
+            async with AsyncSessionLocal() as db:
+                account = await db.get(InstagramAccount, account_id_)
+                if account:
+                    return account.access_token
+                return None
+
+        access_token_for_account = asyncio.run(get_access_token_async(recipient_account_id))
+
+        if not access_token_for_account:
+            logger.error(f"Access token not found for account ID: {recipient_account_id}")
+            return {"status": "error", "message": "Access token not found"}
+
+        result = asyncio.run(sendreply(access_token_for_account, comment_id, message_to_be_sent))
         logger.info(f"Reply sent to comment {comment_id}. Result: {result}")
         return result
     except Exception as e:
@@ -183,7 +257,7 @@ def llm_response(api_key, model_name, query):
     headers = {"Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": query}]}]} # Use the full prompt directly
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload) # Keeping requests for LLM - can be async later if needed
         if response.ok:
             response_json = response.json()
             if 'candidates' in response_json and response_json['candidates']:
@@ -196,7 +270,7 @@ def llm_response(api_key, model_name, query):
         raise Exception(f"An error occurred: {str(e)}")
 
 
-def postmsg(access_token, recipient_id, message_to_be_sent):
+async def postmsg(access_token, recipient_id, message_to_be_sent): # Async function
     """Sends a direct message to Instagram."""
     url = "https://graph.instagram.com/v21.0/me/messages"
     headers = {
@@ -211,13 +285,12 @@ def postmsg(access_token, recipient_id, message_to_be_sent):
             "text": message_to_be_sent
         }
     }
+    async with httpx.AsyncClient() as client: # Using async client
+        response = await client.post(url, headers=headers, json=json_body)
+        return response.json()
 
-    response = requests.post(url, headers=headers, json=json_body)
-    data = response.json()
-    return data
 
-
-def sendreply(access_token, comment_id, message_to_be_sent):
+async def sendreply(access_token, comment_id, message_to_be_sent): # Async function
     """Sends a reply to an Instagram comment."""
     url = f"https://graph.instagram.com/v22.0/{comment_id}/replies"
 
@@ -225,49 +298,36 @@ def sendreply(access_token, comment_id, message_to_be_sent):
         "message": message_to_be_sent,
         "access_token": access_token
     }
-
-    response = requests.post(url, params=params)
-    data = response.json()
-    return data
+    async with httpx.AsyncClient() as client: # Using async client
+        response = await client.post(url, params=params)
+        return response.json()
 
 
 def parse_instagram_webhook(data):
     """
     Parse Instagram webhook events for both direct messages and comments.
-
-    Args:
-        data (dict): The full webhook payload received from Meta
-
-    Returns:
-        list: A list of parsed event dictionaries
     """
     results = []
 
     try:
-        # Extract timestamp from the wrapper data
         event_timestamp = data.get("timestamp")
-
-        # Handle different possible payload structures
         payload = data.get("payload", data) if isinstance(data, dict) else data
-
-        # Extract entries from payload
         entries = payload.get("entry", [])
 
         logger.info(f"Number of entries found: {len(entries)}")
 
         for entry in entries:
-            # Process Direct Messages
             messaging_events = entry.get("messaging", [])
             for messaging_event in messaging_events:
                 sender = messaging_event.get("sender", {})
-                recipient = messaging_event.get("recipient", {})
+                recipient = messaging_event.get("recipient", {}) # Recipient is bot account
                 message = messaging_event.get("message", {})
 
                 if message:
                     message_event_details = {
                         "type": "direct_message",
                         "sender_id": sender.get("id"),
-                        "recipient_id": recipient.get("id"),
+                        "recipient_id": recipient.get("id"), # Bot account ID
                         "text": message.get("text"),
                         "message_id": message.get("mid"),
                         "timestamp": event_timestamp,
@@ -276,7 +336,6 @@ def parse_instagram_webhook(data):
                     }
                     results.append(message_event_details)
 
-            # Process Comments
             changes = entry.get("changes", [])
             for change in changes:
                 if change.get("field") == "comments":
@@ -291,7 +350,8 @@ def parse_instagram_webhook(data):
                             "media_type": comment_value.get("media", {}).get("media_product_type"),
                             "from_username": comment_value.get("from", {}).get("username"),
                             "from_id": comment_value.get("from", {}).get("id"),
-                            "entry_time": entry.get("time")
+                            "entry_time": entry.get("time"),
+                            "recipient_account_id": entry.get('recipient').get('id') if entry.get('recipient') else None #ADDED - Assuming recipient in entry for comments means bot account
                         }
                         results.append(comment_details)
 
@@ -307,11 +367,10 @@ def analyze_sentiment(comment_text):
     sia = SentimentIntensityAnalyzer()
     sentiment_scores = sia.polarity_scores(comment_text)
 
-    # Determine sentiment based on compound score
     if sentiment_scores['compound'] > 0.25:
         sentiment = "Positive"
     else:
-        sentiment = "Negative"  # Consider neutral as negative for default responses
+        sentiment = "Negative"
 
     return sentiment
 
@@ -380,7 +439,7 @@ async def verify_webhook(
 
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """Handle incoming webhook events from Meta."""
     raw_body = await request.body()
     logger.info(f"Received raw webhook payload: {raw_body.decode('utf-8')}")
@@ -403,15 +462,15 @@ async def webhook(request: Request):
 
             # Handle different types of events
             if event["type"] == "direct_message" and event["is_echo"] == False:
-                conversation_id = str(event["sender_id"]) + "_" + str(event["recipient_id"])
+                conversation_id = str(event["sender_id"]) + "_" + str(event["recipient_id"]) # Conversation ID is between sender and bot
 
                 if conversation_id not in message_queue:
                     # New conversation
                     message_queue[conversation_id] = [event]
-                    delay = random.randint(1 * 60, 2 * 60)  # Initial delay (1-2 minutes)
+                    delay = random.randint(0 * 60, 1 * 60)  # Initial delay (1-2 minutes)
                     task = send_dm.apply_async(
                         args=(conversation_id, message_queue.copy()),  # Pass conversation_id and snapshot
-                        countdown=delay, expires=delay + 60
+                        countdown=delay, expires=delay + 600
                     )
                     conversation_task_schedules[conversation_id] = task.id  # Track scheduled task ID
                     logger.info(f"Scheduled initial DM task for new conversation: {conversation_id}, task_id: {task.id}, delay: {delay}s")
@@ -436,7 +495,7 @@ async def webhook(request: Request):
                         logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message)")
 
 
-            elif event["type"] == "comment" and event["from_id"] != account_id:
+            elif event["type"] == "comment" and event["from_id"] != account_id: # Still using global account_id for comment check - can be adjusted
                 # Analyze sentiment of the comment
                 sentiment = analyze_sentiment(event["text"])
                 if sentiment == "Positive":
@@ -444,13 +503,17 @@ async def webhook(request: Request):
                 else:
                     message_to_be_sent = default_comment_response_negative
 
-                # Schedule the reply task
-                delay = random.randint(1 * 60, 2 * 60)  # 10 to 25 minutes in seconds
-                send_delayed_reply.apply_async(
-                    args=(access_token, event["comment_id"], message_to_be_sent),
-                    countdown=delay, expires=delay + 60
-                )
-                logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds")
+                recipient_account_id_for_reply = event.get("recipient_account_id") # Get recipient account ID from parsed event
+                if recipient_account_id_for_reply:
+                    delay = random.randint(0 * 60, 1 * 60)  # 10 to 25 minutes in seconds
+                    send_delayed_reply.apply_async(
+                        args=(event["comment_id"], message_to_be_sent, recipient_account_id_for_reply), # Pass recipient_account_id
+                        countdown=delay, expires=delay + 30
+                    )
+                    logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds for account {recipient_account_id_for_reply}")
+                else:
+                    logger.warning("Recipient account ID not found for comment reply.")
+
 
         # Store event and notify clients
         WEBHOOK_EVENTS.append(event_with_time)
@@ -504,8 +567,6 @@ async def events(request: Request):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    
