@@ -1,16 +1,16 @@
-fastapi
-sse-starlette==0.3.2
-uvicorn
-psutil
-python-dotenv
-requests
-nltk
+fastapi==0.109.0
+uvicorn==0.27.0
+python-dotenv==1.0.0
+httpx==0.26.0
+nltk==3.8.1
 celery[redis]
-redis    
-httpx
+psutil==5.9.8
 sqlalchemy==2.0.25
-asyncpg==0.29.0
-sse-starlette
+psycopg[binary]==3.1.18  # Async PostgreSQL driver
+psycopg-pool==3.2.1  # Connection pooling for psycopg
+asyncpg==0.29.0  # Alternative async PostgreSQL driver
+sse-starlette==1.8.2
 pydantic==2.5.3
-python-multipart==0.0.6    
-psycopg2-binary==2.9.9
+requests==2.31.0  # For Gemini API calls
+python-multipart==0.0.6
+redis
