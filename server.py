@@ -90,7 +90,7 @@ conversation_task_schedules: Dict[str, str] = {}  # Track scheduled task IDs per
 # --- Database Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")  # Get database URL from Render environment
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://user:password@localhost:5432/mydatabase" # Fallback for local testing
+    DATABASE_URL = "postgresql://fittestpostgres_user:G40HxPSZMdTUtmEtNlzQdKKVrOo6ruVa@dpg-cuu3j4d6l47c73ab85cg-a/fittestpostgres" # Fallback for local testing
 
 engine = create_async_engine(DATABASE_URL, echo=False) # Set echo=True for debugging SQL queries
 AsyncSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
