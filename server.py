@@ -239,6 +239,7 @@ def llm_response(api_key, model_name, query):
 
 def postmsg(access_token, recipient_id, message_to_be_sent):
     """Sends a direct message to Instagram."""
+    logger.info(f"Post Function Triggered: Sending DM to recipient {recipient_id} using access token: {access_token}")
     url = "https://graph.instagram.com/v21.0/me/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -255,11 +256,13 @@ def postmsg(access_token, recipient_id, message_to_be_sent):
 
     response = requests.post(url, headers=headers, json=json_body)
     data = response.json()
+    logger.info(f"Response from Instagram API: {data}")
     return data
 
 
 def sendreply(access_token, comment_id, message_to_be_sent):
     """Sends a reply to an Instagram comment."""
+    logger.info(f"Send Reply Function Triggered: Sending reply to comment {comment_id} using access token: {access_token}")
     url = f"https://graph.instagram.com/v22.0/{comment_id}/replies"
 
     params = {
@@ -269,6 +272,7 @@ def sendreply(access_token, comment_id, message_to_be_sent):
 
     response = requests.post(url, params=params)
     data = response.json()
+    logger.info(f"Response from Instagram Reply API: {data}")
     return data
 
 
