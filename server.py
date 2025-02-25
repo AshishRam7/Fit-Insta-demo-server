@@ -72,8 +72,8 @@ default_comment_response_negative = "We are sorry to hear you're not satisfied. 
 WEBHOOK_FILE = "webhook_events.json"
 
 # --- MODIFICATION: In-Memory Broker and Backend ---
-CELERY_BROKER_URL = 'memory://'
-CELERY_RESULT_BACKEND = 'cache+memory://'
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "memory://")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "cache+memory://")
 # -------------------------------------------------
 
 # --- MODIFICATION: SQLite Database Setup ---
@@ -105,6 +105,7 @@ celery.conf.update(
     result_serializer='json',
     timezone='UTC',  # Set a consistent timezone
     enable_utc=True,
+    broker_connection_retry_on_startup=True
 )
 
 message_queue = {}  # Store messages per conversation_id
@@ -485,7 +486,7 @@ async def webhook(request: Request):
                     delay = random.randint(1 * 60, 2 * 60)  # Initial delay (1-2 minutes)
                     task = send_dm.apply_async(
                         args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
-                        countdown=delay, expires=delay + 60
+                        countdown=delay, expires=delay +3600
                     )
                     conversation_task_schedules[conversation_id] = task.id  # Track scheduled task ID
                     logger.info(f"Scheduled initial DM task for new conversation: {conversation_id}, task_id: {task.id}, delay: {delay}s, account_id: {account_id_to_use}")
@@ -504,7 +505,7 @@ async def webhook(request: Request):
                         new_delay = 30  # Shorter delay for re-scheduling (e.g., 30 seconds)
                         new_task = send_dm.apply_async(
                             args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
-                            countdown=new_delay, expires=new_delay + 60
+                            countdown=new_delay, expires=new_delay + 3600
                         )
                         conversation_task_schedules[conversation_id] = new_task.id  # Track new task ID
                         logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message), account_id: {account_id_to_use}")
