@@ -24,22 +24,18 @@ from nltk.sentiment import SentimentIntensityAnalyzer
 from celery import Celery
 import random
 
-# --- Database Imports ---
-from sqlalchemy import create_engine, Column, String
-from sqlalchemy.orm import sessionmaker, declarative_base
-# -----------------------
-
 nltk.download('vader_lexicon')
 
 load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+
 # Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="Meta Webhook Server")
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +46,6 @@ app.add_middleware(
 )
 
 START_TIME = time.time()
-
 
 # Store webhook events - using deque with max size to prevent memory issues
 WEBHOOK_EVENTS = deque(maxlen=100)
@@ -64,6 +59,7 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 model_name = "gemini-1.5-flash"
 
+
 default_dm_response_positive = "Thanks for your kind words! We appreciate your support."
 default_dm_response_negative = "We are sorry to hear you're not satisfied. Please tell us more about this so that we can improve."
 default_comment_response_positive = "Thanks for your kind words! We appreciate your support."
@@ -76,26 +72,15 @@ CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "memory://")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "cache+memory://")
 # -------------------------------------------------
 
-# --- MODIFICATION: SQLite Database Setup ---
-DATABASE_URL = "sqlite:///./accounts.db"  # Database file in the same directory
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-class AccountDB(Base):
-    __tablename__ = "accounts"
-
-    account_id = Column(String, primary_key=True, index=True)
-    access_token = Column(String)
-
-def create_db_and_tables():
-    Base.metadata.create_all(bind=engine)
-
-# Run database creation on startup
-@app.on_event("startup")
-async def startup_event():
-    create_db_and_tables()
-# --------------------------------------------
+# --- MODIFICATION: Load Account Credentials from Environment Variable ---
+ACCOUNTS_JSON = os.getenv("ACCOUNTS", '{}') # Default to empty JSON object if not set
+try:
+    ACCOUNT_CREDENTIALS: Dict[str, str] = json.loads(ACCOUNTS_JSON)
+    logger.info("Account credentials loaded from environment variable ACCOUNTS.")
+except json.JSONDecodeError:
+    ACCOUNT_CREDENTIALS: Dict[str, str] = {}
+    logger.error("Failed to parse ACCOUNTS environment variable as JSON. Using empty account credentials.")
+# ----------------------------------------------------------------------
 
 
 celery = Celery(__name__, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
@@ -111,6 +96,21 @@ celery.conf.update(
 message_queue = {}  # Store messages per conversation_id
 conversation_task_schedules = {}  # Track scheduled task IDs per conversation
 
+def startup_event():
+    inspector = celery.control.inspect()
+    active_tasks = inspector.active()
+    if active_tasks:
+        task_count = sum(len(tasks) for tasks in active_tasks.values())
+        logger.warning(f"WARNING: {task_count} Celery tasks are still active on startup:")
+        for worker, tasks in active_tasks.items():
+            if tasks:
+                logger.warning(f"  Worker {worker}:")
+                for task in tasks:
+                    logger.warning(f"    - {task['name']} (id: {task['id']})")
+    else:
+        logger.info("No active Celery tasks on startup.")
+        
+startup_event()
 
 @celery.task(name="send_dm")
 def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_use):  # Added account_id_to_use
@@ -206,17 +206,12 @@ def load_events_from_file():
             logger.error(f"Failed to load events from file: {e}")
 
 def get_access_token_for_account(account_id):
-    """Retrieve access token for a given account ID from SQLite DB."""
-    db = SessionLocal()
-    try:
-        db_account = db.query(AccountDB).filter(AccountDB.account_id == account_id).first()
-        if db_account:
-            return db_account.access_token
-        else:
-            logger.error(f"No access token found for account ID: {account_id} in DB")
-            raise ValueError(f"No access token found for account ID: {account_id}")
-    finally:
-        db.close()
+    """Retrieve access token for a given account ID from in-memory dictionary."""
+    access_token = ACCOUNT_CREDENTIALS.get(account_id)
+    if not access_token:
+        logger.error(f"No access token found for account ID: {account_id} in ACCOUNT_CREDENTIALS.")
+        raise ValueError(f"No access token found for account ID: {account_id}")
+    return access_token
 
 
 def llm_response(api_key, model_name, query):
@@ -425,34 +420,6 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
-class AccountCredentials(BaseModel):
-    account_id: str
-    access_token: str
-
-@app.post("/accounts")
-async def add_account_credentials(creds: AccountCredentials):
-    """Add or update account credentials in SQLite DB."""
-    db = SessionLocal()
-    try:
-        db_account = AccountDB(account_id=creds.account_id, access_token=creds.access_token)
-        db.merge(db_account) # Use merge to handle updates if account_id exists
-        db.commit()
-        logger.info(f"Account credentials saved to DB for account ID: {creds.account_id}")
-        return {"message": "Account credentials saved successfully"}
-    finally:
-        db.close()
-
-@app.get("/accounts")
-async def get_account_credentials():
-    """Retrieve all stored account credentials from SQLite DB."""
-    db = SessionLocal()
-    try:
-        accounts = db.query(AccountDB).all()
-        account_dict = {account.account_id: account.access_token for account in accounts}
-        return {"accounts": account_dict}
-    finally:
-        db.close()
-
 @app.post("/webhook")
 async def webhook(request: Request):
     """Handle incoming webhook events from Meta."""
@@ -578,6 +545,10 @@ async def events(request: Request):
 
 # Serve static HTML
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# --- MODIFICATION: Celery task check on startup ---
+
+# --------------------------------------------------
 
 
 if __name__ == "__main__":
