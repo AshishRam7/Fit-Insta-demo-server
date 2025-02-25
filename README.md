@@ -25,21 +25,21 @@ This project is a powerful and flexible Instagram automation server bot built us
 *   **Comment Automation:**
     *   Automatically replies to Instagram comments based on sentiment (Positive/Negative) with default responses.
     *   Schedules delayed comment replies using Celery.
-*   **Account Management:** Stores and retrieves Instagram access tokens securely using an SQLite database, allowing for multi-account support (expandable).
-*   **Scalable Task Processing:** Utilizes Celery for asynchronous task management, ensuring efficient handling of responses and preventing blocking the main API server.
+*   **Account Management:** Stores Instagram access tokens as environment variables, supporting multi-account setup via configuration.
+*   **Scalable Task Processing:** Utilizes Celery for asynchronous task management, ensuring efficient handling of responses and preventing blocking the main API server. **Currently configured with in-memory broker and backend for simplified setup.** For production, consider using Redis or RabbitMQ.
 *   **Real-time Event Streaming (SSE):** Provides a Server-Sent Events endpoint (`/events`) to stream webhook events in real-time to connected clients for monitoring and debugging.
 *   **Health Monitoring:** Includes `/ping` and `/health` endpoints for server health checks and uptime monitoring.
-*   **Configuration via Environment Variables:**  Easily configure sensitive information (API keys, tokens) using a `.env` file.
+*   **Configuration via Environment Variables:**  Easily configure sensitive information (API keys, tokens, account details) using a `.env` file and environment variables.
 *   **Detailed Logging:**  Comprehensive logging for debugging and monitoring bot activity.
 *   **Easy Setup:**  Simple installation and configuration process.
 
 ## Tech Stack
 
 *   **Backend Framework:** [FastAPI](https://fastapi.tiangolo.com/) (for building the API server)
-*   **Asynchronous Task Queue:** [Celery](https://docs.celeryq.dev/en/stable/) (for managing background tasks like sending responses)
+*   **Asynchronous Task Queue:** [Celery](https://docs.celeryq.dev/en/stable/) (for managing background tasks like sending responses) **(In-Memory Broker & Backend by default)**
 *   **Language Model (LLM):** [Google Gemini API](https://ai.google.dev/gemini-api) (for generating dynamic DM responses)
 *   **Sentiment Analysis:** [NLTK (VADER)](https://www.nltk.org/howto/vader.html) (for sentiment analysis of text)
-*   **Database:** [SQLite](https://www.sqlite.org/index.html) (for storing account access tokens - easily replaceable with other databases)
+*   **Database:** **In-Memory Dictionary** (for storing account access tokens via environment variables - consider more persistent storage for production)
 *   **Real-time Communication:** [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) via `sse_starlette`
 *   **HTTP Client:** [requests](https://requests.readthedocs.io/en/latest/) (for making API calls to Instagram and Google Gemini)
 *   **Environment Management:** [python-dotenv](https://pypi.org/project/python-dotenv/) (for loading environment variables from `.env` file)
@@ -72,11 +72,13 @@ Follow these steps to get the Instagram Automation Bot up and running:
         VERIFY_TOKEN="YOUR_VERIFY_TOKEN"   # A secret token you define for webhook verification
         GEMINI_API_KEY="YOUR_GEMINI_API_KEY" # Your Google Gemini API Key (optional if not using LLM)
         INSTAGRAM_ACCOUNT_ID="YOUR_INSTAGRAM_BUSINESS_ACCOUNT_ID" # Your Instagram Business Account ID (numeric ID)
+        ACCOUNTS='{"YOUR_INSTAGRAM_BUSINESS_ACCOUNT_ID": "YOUR_INSTAGRAM_ACCESS_TOKEN"}' # JSON string of Instagram Account IDs and Access Tokens
         ```
         *   **`APP_SECRET`**:  Found in your Meta App settings under "Basic" -> "App Secret".
         *   **`VERIFY_TOKEN`**:  Choose a strong, random string for your verify token. You'll need to use this same token when setting up the webhook in your Meta App.
         *   **`GEMINI_API_KEY`**:  Your API key from Google Cloud for accessing the Gemini API. If you don't intend to use the LLM, you can leave this empty, but the bot will rely solely on default responses.
-        *   **`INSTAGRAM_ACCOUNT_ID`**: Your Instagram Business Account ID. This is the numeric ID of your Instagram account.
+        *   **`INSTAGRAM_ACCOUNT_ID`**: Your primary Instagram Business Account ID. This is used for comment replies and as a default if needed.
+        *   **`ACCOUNTS`**:  A JSON string that defines a dictionary mapping your Instagram Business Account IDs (as strings) to their corresponding Instagram Access Tokens.  For example: `'{"1234567890": "YOUR_ACCESS_TOKEN_1", "0987654321": "YOUR_ACCESS_TOKEN_2"}'`.  You can manage multiple accounts by adding more key-value pairs to this JSON string. Ensure the JSON is valid.
 
 4.  **Install Dependencies:**
 
@@ -147,26 +149,16 @@ Follow these steps to get the Instagram Automation Bot up and running:
         *   `business_account`
     *   Click "Verify and Save". If successful, Meta will verify your webhook endpoint.
 
-2.  **Add Instagram Account Credentials:**
+2.  **Configure Instagram Account Credentials in `.env`:**
 
-    *   Use the `/accounts` endpoint (POST method) to add or update access tokens for your Instagram accounts. You can use the interactive API documentation at `/docs` or send a POST request using tools like `curl` or Postman.
-    *   **Request Body (JSON example):**
-
-        ```json
-        {
-          "account_id": "YOUR_INSTAGRAM_BUSINESS_ACCOUNT_ID",
-          "access_token": "YOUR_INSTAGRAM_ACCESS_TOKEN"
-        }
-        ```
-        *   **`account_id`**: Your Instagram Business Account ID (numeric ID).
-        *   **`access_token`**: The Instagram Access Token for your account. You can generate this token in your Meta Developer App under "Instagram" -> "Basic Permissions" -> "Generate Access Token". Make sure you have granted the necessary permissions to your app for the access token.
+    *   Ensure you have correctly configured the `ACCOUNTS` environment variable in your `.env` file as described in the "Setup and Installation" section. This is where you manage your Instagram account access tokens.  **No separate API endpoint for account management is provided in this version; all account details are managed via the `ACCOUNTS` environment variable.**
 
 3.  **Interact with your Instagram Account:**
 
-    Once the webhook is set up and you've added your account credentials, the bot will automatically start processing incoming DMs and comments.
+    Once the webhook is set up and you've configured your account credentials in the `.env` file, the bot will automatically start processing incoming DMs and comments.
 
-    *   **Direct Messages:** Send a direct message to your Instagram Business account. The bot will analyze the sentiment and respond after a short delay using the Language Model (if configured) or default responses.
-    *   **Comments:** Comment on a post on your Instagram Business account. The bot will analyze the sentiment and reply to your comment after a delay with a default response.
+    *   **Direct Messages:** Send a direct message to your Instagram Business account. The bot will analyze the sentiment and respond after a short delay using the Language Model (if configured) or default responses. The bot will use the access token associated with the recipient Instagram Business Account to send the response.
+    *   **Comments:** Comment on a post on your Instagram Business account. The bot will analyze the sentiment and reply to your comment after a delay with a default response. The bot will use the access token associated with the `INSTAGRAM_ACCOUNT_ID` environment variable to send comment replies.
 
 4.  **Monitor Real-time Events (SSE):**
 
@@ -185,8 +177,7 @@ Follow these steps to get the Instagram Automation Bot up and running:
 *   **Language Model Prompts:** Customize the system prompt for the Google Gemini model by editing the `collection_system_prompt/system_prompt.txt` file. You can tailor this prompt to guide the LLM to generate responses that better align with your brand voice and communication style.
 *   **Sentiment Analysis Threshold:** Adjust the sentiment threshold in the `analyze_sentiment` function in `main.py` to fine-tune how sentiment is classified (Positive/Negative).
 *   **Response Delays:** Modify the `random.randint()` values in the webhook handler in `main.py` to change the delay ranges for DM and comment responses.
-*   **Database:** You can easily switch to a different database (e.g., PostgreSQL, MySQL) by modifying the SQLAlchemy database configuration in `main.py`.
-*   **Celery Configuration:** For production deployments, you should replace the in-memory Celery broker and backend with a more robust solution like Redis or RabbitMQ. Configure `CELERY_BROKER_URL` and `CELERY_RESULT_BACKEND` accordingly.
+*   **Celery Configuration:** For production deployments, it is **strongly recommended** to replace the in-memory Celery broker and backend with a more robust solution like Redis or RabbitMQ. Configure `CELERY_BROKER_URL` and `CELERY_RESULT_BACKEND` environment variables accordingly to point to your Redis or RabbitMQ setup.
 
 ## Contributing
 

@@ -109,7 +109,7 @@ def startup_event():
                     logger.warning(f"    - {task['name']} (id: {task['id']})")
     else:
         logger.info("No active Celery tasks on startup.")
-        
+
 startup_event()
 
 @celery.task(name="send_dm")
