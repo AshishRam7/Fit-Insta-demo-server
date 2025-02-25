@@ -478,7 +478,7 @@ async def webhook(request: Request):
                 if conversation_id not in message_queue:
                     # New conversation
                     message_queue[conversation_id] = [event]
-                    delay = random.randint(0 * 60, 1 * 60)  # Initial delay (1-2 minutes)
+                    delay = random.randint(1 * 60, 2 * 60)  # Initial delay (1-2 minutes)
                     task = send_dm.apply_async(
                         args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
                         countdown=delay, expires=delay + 600
@@ -516,7 +516,7 @@ async def webhook(request: Request):
 
                 account_id_to_use = os.getenv("INSTAGRAM_ACCOUNT_ID") # Default account ID for comments, can be adjusted as needed
                 # Schedule the reply task
-                delay = random.randint(0 * 60, 1* 60)  # 10 to 25 minutes in seconds
+                delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
                 send_delayed_reply.apply_async(
                     args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
                     countdown=delay, expires=delay + 600
