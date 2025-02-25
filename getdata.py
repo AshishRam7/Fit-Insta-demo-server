@@ -4,7 +4,7 @@ import json
 gemini_api_key = "AIzaSyDgH-W60Vk--3rSbTq91lzYoMfc1j1RzFE"
 model_name = "gemini-1.5-flash"
 
-with open("system_prompt.txt", "r") as file:
+with open("collection_system_prompt/system_prompt.txt", "r") as file:
         system_prompt = file.read().strip()
 
 def llm_response(api_key, model_name, query):
