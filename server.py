@@ -482,20 +482,25 @@ async def webhook(request: Request):
             elif event["type"] == "comment": # Removed the ACCOUNT_CREDENTIALS check from here
                 if event["to_id"] in ACCOUNT_CREDENTIALS: # Check inside now
                     # Analyze sentiment of the comment
-                    sentiment = analyze_sentiment(event["text"])
-                    if sentiment == "Positive":
-                        message_to_be_sent = default_comment_response_positive
-                    else:
-                        message_to_be_sent = default_comment_response_negative
+                    if event["from_id"] == event["to_id"]:
+                        logger.info(f"Comment received from the same account ID: {event['from_id']}. Ignoring.")
+                        break
 
-                    account_id_to_use = event["to_id"]# Default account ID for comments, can be adjusted as needed
-                    # Schedule the reply task
-                    delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
-                    send_delayed_reply.apply_async(
-                        args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
-                        countdown=delay, expires=delay + 600
-                    )
-                    logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
+                    else:
+                        sentiment = analyze_sentiment(event["text"])
+                        if sentiment == "Positive":
+                            message_to_be_sent = default_comment_response_positive
+                        else:
+                            message_to_be_sent = default_comment_response_negative
+
+                        account_id_to_use = event["to_id"]# Default account ID for comments, can be adjusted as needed
+                        # Schedule the reply task
+                        delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
+                        send_delayed_reply.apply_async(
+                            args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
+                            countdown=delay, expires=delay + 600
+                        )
+                        logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
                 else:
                     logger.warning(f"Comment received for unconfigured account ID: {event['to_id']}. Ignoring.")
                     # Optionally, you could send a default "we don't handle comments for this page" response or just ignore.
