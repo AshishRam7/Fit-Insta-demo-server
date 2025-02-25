@@ -332,7 +332,7 @@ def parse_instagram_webhook(data):
                             "media_type": comment_value.get("media", {}).get("media_product_type"),
                             "from_username": comment_value.get("from", {}).get("username"),
                             "from_id": comment_value.get("from", {}).get("id"),
-                            "to_id": entry.get("time"),
+                            "to_id": entry.get("id"),
                             "entry_time": entry.get("time")
                         }
                         results.append(comment_details)
