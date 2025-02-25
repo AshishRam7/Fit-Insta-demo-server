@@ -7,3 +7,4 @@ requests
 nltk
 celery[redis]
 redis          
+sqlalchemy
