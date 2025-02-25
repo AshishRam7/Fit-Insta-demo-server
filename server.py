@@ -332,6 +332,7 @@ def parse_instagram_webhook(data):
                             "media_type": comment_value.get("media", {}).get("media_product_type"),
                             "from_username": comment_value.get("from", {}).get("username"),
                             "from_id": comment_value.get("from", {}).get("id"),
+                            "to_id": entry.get("time"),
                             "entry_time": entry.get("time")
                         }
                         results.append(comment_details)
@@ -478,22 +479,26 @@ async def webhook(request: Request):
                         logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message), account_id: {account_id_to_use}")
 
 
-            elif event["type"] == "comment" and event["from_id"] != account_id:
-                # Analyze sentiment of the comment
-                sentiment = analyze_sentiment(event["text"])
-                if sentiment == "Positive":
-                    message_to_be_sent = default_comment_response_positive
-                else:
-                    message_to_be_sent = default_comment_response_negative
+            elif event["type"] == "comment": # Removed the ACCOUNT_CREDENTIALS check from here
+                if event["to_id"] in ACCOUNT_CREDENTIALS: # Check inside now
+                    # Analyze sentiment of the comment
+                    sentiment = analyze_sentiment(event["text"])
+                    if sentiment == "Positive":
+                        message_to_be_sent = default_comment_response_positive
+                    else:
+                        message_to_be_sent = default_comment_response_negative
 
-                account_id_to_use = os.getenv("INSTAGRAM_ACCOUNT_ID") # Default account ID for comments, can be adjusted as needed
-                # Schedule the reply task
-                delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
-                send_delayed_reply.apply_async(
-                    args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
-                    countdown=delay, expires=delay + 600
-                )
-                logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
+                    account_id_to_use = event["to_id"]# Default account ID for comments, can be adjusted as needed
+                    # Schedule the reply task
+                    delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
+                    send_delayed_reply.apply_async(
+                        args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
+                        countdown=delay, expires=delay + 600
+                    )
+                    logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
+                else:
+                    logger.warning(f"Comment received for unconfigured account ID: {event['to_id']}. Ignoring.")
+                    # Optionally, you could send a default "we don't handle comments for this page" response or just ignore.
 
         # Store event and notify clients
         WEBHOOK_EVENTS.append(event_with_time)
