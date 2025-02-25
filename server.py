@@ -17,11 +17,17 @@ import time
 import os
 from dotenv import load_dotenv
 import requests
-from nltk.sentiment import SentimentIntensityAnalyzer
 import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+
 
 from celery import Celery
 import random
+
+# --- Database Imports ---
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+# -----------------------
 
 nltk.download('vader_lexicon')
 
@@ -70,9 +76,26 @@ CELERY_BROKER_URL = 'memory://'
 CELERY_RESULT_BACKEND = 'cache+memory://'
 # -------------------------------------------------
 
-# --- MODIFICATION: Local Storage for Account Credentials ---
-ACCOUNT_CREDENTIALS: Dict[str, str] = {}  # Store account_id: access_token
-# -------------------------------------------------
+# --- MODIFICATION: SQLite Database Setup ---
+DATABASE_URL = "sqlite:///./accounts.db"  # Database file in the same directory
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class AccountDB(Base):
+    __tablename__ = "accounts"
+
+    account_id = Column(String, primary_key=True, index=True)
+    access_token = Column(String)
+
+def create_db_and_tables():
+    Base.metadata.create_all(bind=engine)
+
+# Run database creation on startup
+@app.on_event("startup")
+async def startup_event():
+    create_db_and_tables()
+# --------------------------------------------
 
 
 celery = Celery(__name__, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
@@ -129,7 +152,6 @@ def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_us
         # Send the combined response
         try:
             access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
-            logger.info(f"Token fetched: {access_token_to_use}")
             result = postmsg(access_token_to_use, recipient_id, response_text) # MODIFIED: Use dynamic access token
             logger.info(f"Sent combined response to {recipient_id} using account {account_id_to_use}. Result: {result}")
         except Exception as e:
@@ -183,12 +205,17 @@ def load_events_from_file():
             logger.error(f"Failed to load events from file: {e}")
 
 def get_access_token_for_account(account_id):
-    """Retrieve access token for a given account ID from local storage."""
-    access_token = ACCOUNT_CREDENTIALS["account_id"]
-    if not access_token:
-        logger.error(f"No access token found for account ID: {account_id}")
-        raise ValueError(f"No access token found for account ID: {account_id}") # Or handle as needed
-    return access_token
+    """Retrieve access token for a given account ID from SQLite DB."""
+    db = SessionLocal()
+    try:
+        db_account = db.query(AccountDB).filter(AccountDB.account_id == account_id).first()
+        if db_account:
+            return db_account.access_token
+        else:
+            logger.error(f"No access token found for account ID: {account_id} in DB")
+            raise ValueError(f"No access token found for account ID: {account_id}")
+    finally:
+        db.close()
 
 
 def llm_response(api_key, model_name, query):
@@ -399,10 +426,27 @@ class AccountCredentials(BaseModel):
 
 @app.post("/accounts")
 async def add_account_credentials(creds: AccountCredentials):
-    """Add or update account credentials."""
-    ACCOUNT_CREDENTIALS[creds.account_id] = creds.access_token
-    logger.info(f"Account credentials added/updated for account ID: {creds.account_id}")
-    return {"message": "Account credentials saved successfully"}
+    """Add or update account credentials in SQLite DB."""
+    db = SessionLocal()
+    try:
+        db_account = AccountDB(account_id=creds.account_id, access_token=creds.access_token)
+        db.merge(db_account) # Use merge to handle updates if account_id exists
+        db.commit()
+        logger.info(f"Account credentials saved to DB for account ID: {creds.account_id}")
+        return {"message": "Account credentials saved successfully"}
+    finally:
+        db.close()
+
+@app.get("/accounts")
+async def get_account_credentials():
+    """Retrieve all stored account credentials from SQLite DB."""
+    db = SessionLocal()
+    try:
+        accounts = db.query(AccountDB).all()
+        account_dict = {account.account_id: account.access_token for account in accounts}
+        return {"accounts": account_dict}
+    finally:
+        db.close()
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -498,10 +542,6 @@ async def get_webhook_events():
     """Retrieve all stored webhook events."""
     return {"events": list(WEBHOOK_EVENTS)}
 
-@app.get("/accounts") # New GET endpoint to retrieve account credentials
-async def get_account_credentials():
-    """Retrieve all stored account credentials."""
-    return {"accounts": ACCOUNT_CREDENTIALS}
 
 async def event_generator(request: Request):
     """Generate Server-Sent Events."""
