@@ -246,6 +246,7 @@ def send_delayed_reply(comment_id: str, message_to_be_sent: str, account_id_to_u
     Returns:
         The response data from the sendreply function.
     """
+
     try:
         access_token_to_use = get_access_token_for_account(account_id_to_use)  # Get access token dynamically
         result = sendreply(access_token_to_use, comment_id, message_to_be_sent)  # Use dynamic access token
@@ -597,11 +598,13 @@ async def webhook(request: Request):
 
                     else:
                         sentiment = analyze_sentiment(event["text"]) # Analyze comment sentiment
-                        if sentiment == "Positive":
-                            message_to_be_sent = default_comment_response_positive
-                        else:
-                            message_to_be_sent = default_comment_response_negative
-
+                        message_to_be_sent = llm_response(gemini_api_key, model_name, event["text"])  # Generate response using LLM
+                        if message_to_be_sent == Exception:
+                            if sentiment == "Positive":
+                                message_to_be_sent = default_comment_response_positive
+                            else:   
+                                message_to_be_sent = default_comment_response_negative
+                        
                         account_id_to_use = event["to_id"]  # Use comment's 'to_id' as account_id
                         # Schedule the reply task
                         delay = random.randint(1 * 60, 2 * 60)  # 1 to 2 minutes delay for comment reply
