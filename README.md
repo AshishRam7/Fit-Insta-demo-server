@@ -1,7 +1,5 @@
 # Instagram Automation Server Bot
 
-![Instagram Automation Bot](path/to/your/image.png)
-
 [![Project Status](https://img.shields.io/badge/Status-Active-brightgreen.svg)](https://github.com/your-github-username/your-repo-name)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/Python-3.11+-brightgreen.svg)](https://www.python.org/downloads/)
@@ -38,7 +36,7 @@ This project is a robust and scalable **Instagram Automation Server Bot** built 
 
 ## **Architecture**
 
-<descriptive_img>
+![diagram-export-3-4-2025-1_51_38-PM](https://github.com/user-attachments/assets/433c5fe7-99be-46f7-8837-452b4485ba69)
 
 The system consists of three primary components:
 
@@ -127,6 +125,8 @@ uvicorn server:app --reload --host 0.0.0.0 --port 8000
 
 ## **Deployment on Render**
 
+**Important Note:** Ensure that the Web Service and Redis Instance are present inside the same Render workspace to make sure the connection between them is established
+
 ### **1. Provision Redis Instance**
 - Create a **Redis instance** on Render.
 - Obtain connection URL(Internal URL): `redis://<username>:<password>@<host>:<port>`.
@@ -166,17 +166,62 @@ CELERY_RESULT_BACKEND="redis://localhost:6379/0"
 ## **Meta App Setup for Webhooks**
 
 1. **Create a Meta App** on the [Meta Developer Dashboard](https://developers.facebook.com/).
-2. **Navigate to Subscriptions** → Subscribe to **Instagram**.
-3. Click **API Setup with Instagram Login**.
-4. Set the Webhook URL as `https://<public_url>/webhook` and use the verification token from `Environment variables`.
-5. Click **Verify Webhook Server**.
-6. **Add Instagram Tester Accounts**:
-   - Click **Add Account**.
-   - If access token is not displayed, navigate to **App Roles** → **Roles Subsection**.
-   - Click **Add People**, select **Instagram Tester Account**, and provide username & login.
-   - Go to **API Setup with Instagram Login** → **Generate Token**.
+
+   <img width="947" alt="image" src="https://github.com/user-attachments/assets/89dd2b0f-036a-485f-afe9-391a6d358977" />
+
+3. **Navigate to Products** → **Add Products** → Subscribe to **Instagram**.
+
+   <img width="923" alt="image" src="https://github.com/user-attachments/assets/07922c9f-1166-49e2-afb6-1b55c40f4510" />
+
+5. Click **API Setup with Instagram Login** on the sidepanel under **Products -> Instagram**.
+
+   <img width="166" alt="image" src="https://github.com/user-attachments/assets/8d249dd1-09c7-4bde-8046-ea078f2699dd" />
+
+7. **Add Instagram Tester Accounts and generate access tokens**:
+   - Navigate to **App Roles** → **Roles Subsection**.
+
+     ![image](https://github.com/user-attachments/assets/249f270d-982b-425b-b665-e431267085e5)
+
+   - Click **Add People**, select **Instagram Tester Account**, and provide username & login. Verify whether the account has been added by refreshing the page -> perform this for all accounts you want to connect to the server.
+
+     ![image](https://github.com/user-attachments/assets/88d2d7ba-a2bb-4b43-91af-40a4ebdaa8ff)
+
+   - Go to **API Setup with Instagram Login** → **Generate Access Tokens**.
+
+     ![image](https://github.com/user-attachments/assets/a368078f-dde7-4e96-8427-5ba750bb989b)
+
+   - Login with your Instagram account(only public + business + professional Instagram can be added) , and allow all permissions requested.
+
+     ![image](https://github.com/user-attachments/assets/9051b66a-7f04-4f46-9e01-310729b1f1fa)
+
+   - If token generated copy and store safely along with that particular account id(We will be adding this in the environment variables)
    - If a blank white screen appears, inspect the page and search for `IGAA`.
+
+     ![image](https://github.com/user-attachments/assets/33e755ef-35b6-4a05-9c00-5bc8573b41ec)
+
    - Copy the token and store it securely.
+
+8. Copy details like **App Secret**, **account_id's and their respective access tokens** and add them to the enviroment variables in the right format mentionned already, and refresh the deployment after the change to make sure the changes are live.
+
+9. Set the Webhook URL in Instagram  as `https://<public_deployed_url>/webhook` and use the verification token you had setup in `Environment variables`.
+
+   ![image](https://github.com/user-attachments/assets/9bd7d6a1-e0fe-40f5-9b22-fa723b505e07)
+
+10. Make the App live before the next verification step.
+
+    <img width="866" alt="image" src="https://github.com/user-attachments/assets/a085ce24-7ef0-420d-a29f-bc994f4e3c40" />
+
+11. Toggle the **add certificate** option and then click **Verify Webhook Server** to verify your server and start receiving your webhook notifications.
+
+    ![image](https://github.com/user-attachments/assets/70602b8b-1160-4504-9ad7-64dd691e621f)
+
+12. Subscribe to **comments, live_comments** and the **messages** webhook_fields.
+
+    ![image](https://github.com/user-attachments/assets/669282ad-9623-4c94-b138-02eea097ae6b)
+
+
+**Importante Note* : The Instagram Account_id and access tokens are sensitive information and need to be stored safely
+
 
 ---
 
