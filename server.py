@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Request, Response, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from typing import List, Dict
+from typing import List, Dict, Any, Optional  # Importing 'Any' and 'Optional' for type hinting
 from pydantic import BaseModel
 import hashlib
 import hmac
@@ -19,70 +18,116 @@ from dotenv import load_dotenv
 import requests
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
-
-
+from api_tasks.postmsg import postmsg
+from api_tasks.sendreply import sendreply
 from celery import Celery
 import random
+import configparser
 
-nltk.download('vader_lexicon')
+"""
+This FastAPI application serves as a webhook endpoint for Meta (Facebook/Instagram)
+and processes direct messages and comments using Celery for asynchronous tasks.
+
+It leverages Google Gemini API for generating responses and NLTK for sentiment analysis.
+Configuration is managed through a config.ini file and environment variables.
+"""
+
+nltk.download('vader_lexicon')  # Ensure VADER lexicon is downloaded for sentiment analysis
 
 load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+# Removed: STATIC_DIR = os.path.join(BASE_DIR, "static") # Static file directory is no longer used
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
+# --- Configuration Class ---
+class Config:
+    """
+    Configuration class to load settings from config.ini and environment variables.
+
+    Environment variables take precedence over settings in config.ini.
+    """
+    def __init__(self):
+        config_parser = configparser.ConfigParser()
+        config_parser.read('config.ini')  # Read settings from config.ini file
+
+        # --- API Section ---
+        self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", config_parser.get('api', 'gemini_api_key'))
+        self.MODEL_NAME = os.getenv("MODEL_NAME", config_parser.get('api', 'model_name'))
+        self.APP_SECRET = os.getenv("APP_SECRET", config_parser.get('api', 'app_secret'))
+        self.VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", config_parser.get('api', 'verify_token'))
+
+        # --- Celery Section ---
+        self.CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", config_parser.get('celery', 'broker_url'))
+        self.CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", config_parser.get('celery', 'result_backend'))
+
+        # --- Default Responses Section ---
+        self.DEFAULT_DM_RESPONSE_POSITIVE = os.getenv("DEFAULT_DM_RESPONSE_POSITIVE", config_parser.get('defaults', 'dm_response_positive'))
+        self.DEFAULT_DM_RESPONSE_NEGATIVE = os.getenv("DEFAULT_DM_RESPONSE_NEGATIVE", config_parser.get('defaults', 'dm_response_negative'))
+        self.DEFAULT_COMMENT_RESPONSE_POSITIVE = os.getenv("DEFAULT_COMMENT_RESPONSE_POSITIVE", config_parser.get('defaults', 'comment_response_positive'))
+        self.DEFAULT_COMMENT_RESPONSE_NEGATIVE = os.getenv("DEFAULT_COMMENT_RESPONSE_NEGATIVE", config_parser.get('defaults', 'comment_response_negative'))
+
+        # --- Instagram Section ---
+        self.INSTAGRAM_ACCOUNT_ID_FOR_COMMENTS = os.getenv("INSTAGRAM_ACCOUNT_ID", config_parser.get('instagram', 'account_id_for_comments'))
+
+        # --- Account Credentials (JSON from ENV, config.ini provides default structure) ---
+        accounts_json_str = os.getenv("ACCOUNTS", config_parser.get('instagram', 'accounts_json')) # ENV overrides config.ini
+        try:
+            self.ACCOUNT_CREDENTIALS: Dict[str, str] = json.loads(accounts_json_str)
+            logger.info("Account credentials loaded from environment variable ACCOUNTS.")
+        except json.JSONDecodeError:
+            self.ACCOUNT_CREDENTIALS: Dict[str, str] = {}
+            logger.error("Failed to parse ACCOUNTS environment variable as JSON. Using empty account credentials.")
+
+config = Config()  # Instantiate the configuration object
+# --- End Configuration Class ---
+
+
+# Initialize FastAPI application
 app = FastAPI(title="Meta Webhook Server")
 
+# Add CORS middleware to allow cross-origin requests (for development/testing if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins - adjust in production for security
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
-START_TIME = time.time()
+START_TIME = time.time()  # Record server start time for uptime calculation
 
-# Store webhook events - using deque with max size to prevent memory issues
-WEBHOOK_EVENTS = deque(maxlen=100)
+# Data structures for webhook event handling
+WEBHOOK_EVENTS = deque(maxlen=100)  # Store last 100 webhook events in a deque
+CLIENTS: List[asyncio.Queue] = []  # List to hold SSE client queues for event broadcasting
 
-# Store SSE clients
-CLIENTS: List[asyncio.Queue] = []
+# Webhook Credentials (loaded from config object)
+APP_SECRET = config.APP_SECRET
+VERIFY_TOKEN = config.VERIFY_TOKEN
+gemini_api_key = config.GEMINI_API_KEY
+model_name = config.MODEL_NAME
 
-# Webhook Credentials
-APP_SECRET = os.getenv("APP_SECRET")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-model_name = "gemini-1.5-flash"
+# Default response messages (loaded from config object)
+default_dm_response_positive = config.DEFAULT_DM_RESPONSE_POSITIVE
+default_dm_response_negative = config.DEFAULT_DM_RESPONSE_NEGATIVE
+default_comment_response_positive = config.DEFAULT_COMMENT_RESPONSE_POSITIVE
+default_comment_response_negative = config.DEFAULT_COMMENT_RESPONSE_NEGATIVE
 
+WEBHOOK_FILE = "webhook_events.json"  # File to save webhook events for persistence
 
-default_dm_response_positive = "Thanks for your kind words! We appreciate your support."
-default_dm_response_negative = "We are sorry to hear you're not satisfied. Please tell us more about this so that we can improve."
-default_comment_response_positive = "Thanks for your kind words! We appreciate your support."
-default_comment_response_negative = "We are sorry to hear you're not satisfied. Please tell us more about this so that we can improve."
-# Save Webhook Events to JSON File
-WEBHOOK_FILE = "webhook_events.json"
+# --- Celery Configuration ---
+CELERY_BROKER_URL = config.CELERY_BROKER_URL
+CELERY_RESULT_BACKEND = config.CELERY_RESULT_BACKEND
+# ---------------------------
 
-# --- MODIFICATION: In-Memory Broker and Backend ---
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "memory://")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "cache+memory://")
-# -------------------------------------------------
-
-# --- MODIFICATION: Load Account Credentials from Environment Variable ---
-ACCOUNTS_JSON = os.getenv("ACCOUNTS", '{}') # Default to empty JSON object if not set
-try:
-    ACCOUNT_CREDENTIALS: Dict[str, str] = json.loads(ACCOUNTS_JSON)
-    logger.info("Account credentials loaded from environment variable ACCOUNTS.")
-except json.JSONDecodeError:
-    ACCOUNT_CREDENTIALS: Dict[str, str] = {}
-    logger.error("Failed to parse ACCOUNTS environment variable as JSON. Using empty account credentials.")
-# ----------------------------------------------------------------------
+# --- Account Credentials ---
+ACCOUNT_CREDENTIALS: Dict[str, str] = config.ACCOUNT_CREDENTIALS
+# -------------------------
 
 
+# Initialize Celery application
 celery = Celery(__name__, broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
 celery.conf.update(
     task_serializer='json',
@@ -93,10 +138,12 @@ celery.conf.update(
     broker_connection_retry_on_startup=True
 )
 
-message_queue = {}  # Store messages per conversation_id
-conversation_task_schedules = {}  # Track scheduled task IDs per conversation
+message_queue: Dict[str, List[Dict[str, Any]]] = {}  # Store messages per conversation_id
+conversation_task_schedules: Dict[str, str] = {}  # Track scheduled task IDs per conversation
+
 
 def startup_event():
+    """Logs active Celery tasks on startup for monitoring purposes."""
     inspector = celery.control.inspect()
     active_tasks = inspector.active()
     if active_tasks:
@@ -112,19 +159,30 @@ def startup_event():
 
 startup_event()
 
+
 @celery.task(name="send_dm")
-def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_use):  # Added account_id_to_use
-    """Celery task to process and respond to a conversation's messages."""
+def send_dm(conversation_id_to_process: str, message_queue_snapshot: Dict[str, List[Dict[str, Any]]], account_id_to_use: str) -> Dict[str, Any]:
+    """
+    Celery task to process and respond to a conversation's messages.
+
+    Args:
+        conversation_id_to_process: The ID of the conversation to process.
+        message_queue_snapshot: A snapshot of the message queue for processing.
+        account_id_to_use: The Instagram account ID to use for sending the response.
+
+    Returns:
+        A dictionary indicating the task status and processed conversation details.
+    """
     try:
         if conversation_id_to_process not in message_queue_snapshot or not message_queue_snapshot[conversation_id_to_process]:
             logger.info(f"No messages to process for conversation: {conversation_id_to_process}. Task exiting.")
             return {"status": "no_messages_to_process", "conversation_id": conversation_id_to_process}
 
-        messages = message_queue_snapshot[conversation_id_to_process]  # Use the snapshot
+        messages = message_queue_snapshot[conversation_id_to_process]  # Use the snapshot to avoid race conditions
         recipient_id = messages[0]["sender_id"]
         combined_text = "\n".join([msg["text"] for msg in messages])
 
-        sentiment = analyze_sentiment(combined_text) # Analyze sentiment BEFORE LLM call
+        sentiment = analyze_sentiment(combined_text)  # Analyze sentiment BEFORE LLM call
         logger.info(f"Sentiment Analysis Result: Sentiment: {sentiment}, Combined Text: '{combined_text}'")
 
         if sentiment == "Positive":
@@ -139,7 +197,6 @@ def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_us
             system_prompt_content = file.read().strip()
         full_prompt = system_prompt_content + " Message/Conversation input from user: " + combined_text + " "
 
-
         # Generate response using LLM
         try:
             response_text = llm_response(gemini_api_key, model_name, full_prompt)
@@ -152,13 +209,13 @@ def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_us
 
         # Send the combined response
         try:
-            access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
-            result = postmsg(access_token_to_use, recipient_id, response_text) # MODIFIED: Use dynamic access token
+            access_token_to_use = get_access_token_for_account(account_id_to_use)  # Get access token dynamically
+            result = postmsg(access_token_to_use, recipient_id, response_text)  # Use dynamic access token
             logger.info(f"Sent combined response to {recipient_id} using account {account_id_to_use}. Result: {result}")
         except Exception as e:
             logger.error(f"Error sending message to {recipient_id} using account {account_id_to_use}: {e}")
 
-        # Clear ONLY for the processed conversation ID (after processing is successful)
+        # Clear ONLY for the processed conversation ID (after successful processing)
         if conversation_id_to_process in message_queue:  # Double check before deleting (race condition safety)
             del message_queue[conversation_id_to_process]
             logger.info(f"Cleared message queue for conversation: {conversation_id_to_process}")
@@ -173,30 +230,40 @@ def send_dm(conversation_id_to_process, message_queue_snapshot, account_id_to_us
 
     except Exception as e:
         logger.error(f"Error in send_dm task for conversation {conversation_id_to_process}: {e}")
-        raise
+        raise  # Re-raise exception for Celery to handle retries
 
 
 @celery.task(name="send_delayed_reply")
-def send_delayed_reply(comment_id, message_to_be_sent, account_id_to_use): # Added account_id_to_use
-    """Sends a delayed reply to a comment."""
+def send_delayed_reply(comment_id: str, message_to_be_sent: str, account_id_to_use: str) -> Dict[str, Any]:
+    """
+    Sends a delayed reply to an Instagram comment using Celery.
+
+    Args:
+        comment_id: The ID of the comment to reply to.
+        message_to_be_sent: The message content to send as a reply.
+        account_id_to_use: The Instagram account ID to use for sending the reply.
+
+    Returns:
+        The response data from the sendreply function.
+    """
     try:
-        access_token_to_use = get_access_token_for_account(account_id_to_use) # MODIFIED: Get access token dynamically
-        result = sendreply(access_token_to_use, comment_id, message_to_be_sent) # MODIFIED: Use dynamic access token
+        access_token_to_use = get_access_token_for_account(account_id_to_use)  # Get access token dynamically
+        result = sendreply(access_token_to_use, comment_id, message_to_be_sent)  # Use dynamic access token
         logger.info(f"Reply sent to comment {comment_id} using account {account_id_to_use}. Result: {result}")
         return result
     except Exception as e:
         logger.error(f"Error sending reply to comment {comment_id} using account {account_id_to_use}: {e}")
-        raise  # Important: Re-raise for Celery retry handling.
+        raise  # Re-raise exception for Celery retry handling.
 
 
 def save_events_to_file():
-    """Save webhook events to a JSON file."""
+    """Save webhook events to a JSON file for persistence."""
     with open(WEBHOOK_FILE, "w") as f:
         json.dump(list(WEBHOOK_EVENTS), f, indent=4)
 
 
 def load_events_from_file():
-    """Load webhook events from the JSON file (if it exists)."""
+    """Load webhook events from the JSON file at startup if it exists."""
     if os.path.exists(WEBHOOK_FILE):
         try:
             with open(WEBHOOK_FILE, "r") as f:
@@ -205,8 +272,20 @@ def load_events_from_file():
         except Exception as e:
             logger.error(f"Failed to load events from file: {e}")
 
-def get_access_token_for_account(account_id):
-    """Retrieve access token for a given account ID from in-memory dictionary."""
+
+def get_access_token_for_account(account_id: str) -> str:
+    """
+    Retrieve access token for a given account ID from the ACCOUNT_CREDENTIALS dictionary.
+
+    Args:
+        account_id: The Instagram account ID.
+
+    Returns:
+        The access token for the given account ID.
+
+    Raises:
+        ValueError: If no access token is found for the account ID.
+    """
     access_token = ACCOUNT_CREDENTIALS.get(account_id)
     if not access_token:
         logger.error(f"No access token found for account ID: {account_id} in ACCOUNT_CREDENTIALS.")
@@ -214,75 +293,51 @@ def get_access_token_for_account(account_id):
     return access_token
 
 
-def llm_response(api_key, model_name, query):
-    """Generates response using Google Gemini API."""
+def llm_response(api_key: str, model_name: str, query: str) -> str:
+    """
+    Generates response using Google Gemini API.
+
+    Args:
+        api_key: API key for Google Gemini.
+        model_name: Name of the Gemini model to use.
+        query: The query/prompt to send to the LLM.
+
+    Returns:
+        The text response generated by the LLM.
+
+    Raises:
+        Exception: If there's an error during the API request or response processing.
+    """
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": query}]}]} # Use the full prompt directly
+    payload = {"contents": [{"parts": [{"text": query}]}]}  # Construct payload with the query
     try:
         response = requests.post(url, headers=headers, json=payload)
-        if response.ok:
-            response_json = response.json()
-            if 'candidates' in response_json and response_json['candidates']:
-                return response_json['candidates'][0]['content']['parts'][0]['text']
-            else:
-                raise Exception("No candidates found in the response.")
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        response_json = response.json()
+        if 'candidates' in response_json and response_json['candidates']:
+            return response_json['candidates'][0]['content']['parts'][0]['text']
         else:
-            raise Exception(f"Error: {response.status_code}\n{response.text}")
-    except Exception as e:
+            raise Exception("No candidates found in the response.")
+    except requests.exceptions.RequestException as e: # Catch specific request exceptions
+        raise Exception(f"API request failed: {str(e)}")
+    except json.JSONDecodeError as e: # Catch JSON decoding errors
+        raise Exception(f"Failed to decode JSON response: {str(e)}")
+    except Exception as e: # Catch any other exceptions
         raise Exception(f"An error occurred: {str(e)}")
 
 
-def postmsg(access_token, recipient_id, message_to_be_sent):
-    """Sends a direct message to Instagram."""
-    logger.info(f"Post Function Triggered: Sending DM to recipient {recipient_id} using access token: {access_token}")
-    url = "https://graph.instagram.com/v21.0/me/messages"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    json_body = {
-        "recipient": {
-            "id": recipient_id
-        },
-        "message": {
-            "text": message_to_be_sent
-        }
-    }
-
-    response = requests.post(url, headers=headers, json=json_body)
-    data = response.json()
-    logger.info(f"Response from Instagram API: {data}")
-    return data
-
-
-def sendreply(access_token, comment_id, message_to_be_sent):
-    """Sends a reply to an Instagram comment."""
-    logger.info(f"Send Reply Function Triggered: Sending reply to comment {comment_id} using access token: {access_token}")
-    url = f"https://graph.instagram.com/v22.0/{comment_id}/replies"
-
-    params = {
-        "message": message_to_be_sent,
-        "access_token": access_token
-    }
-
-    response = requests.post(url, params=params)
-    data = response.json()
-    logger.info(f"Response from Instagram Reply API: {data}")
-    return data
-
-
-def parse_instagram_webhook(data):
+def parse_instagram_webhook(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Parse Instagram webhook events for both direct messages and comments.
 
     Args:
-        data (dict): The full webhook payload received from Meta
+        data: The full webhook payload received from Meta.
 
     Returns:
-        list: A list of parsed event dictionaries
+        A list of parsed event dictionaries, each representing a message or comment event.
     """
-    results = []
+    results: List[Dict[str, Any]] = []
 
     try:
         # Extract timestamp from the wrapper data
@@ -332,7 +387,7 @@ def parse_instagram_webhook(data):
                             "media_type": comment_value.get("media", {}).get("media_product_type"),
                             "from_username": comment_value.get("from", {}).get("username"),
                             "from_id": comment_value.get("from", {}).get("id"),
-                            "to_id": entry.get("id"),
+                            "to_id": entry.get("id"),  # Added 'to_id' to comment details
                             "entry_time": entry.get("time")
                         }
                         results.append(comment_details)
@@ -344,8 +399,16 @@ def parse_instagram_webhook(data):
     return results
 
 
-def analyze_sentiment(comment_text):
-    """Analyzes sentiment of text using NLTK's VADER."""
+def analyze_sentiment(comment_text: str) -> str:
+    """
+    Analyzes sentiment of text using NLTK's VADER sentiment intensity analyzer.
+
+    Args:
+        comment_text: The text to analyze for sentiment.
+
+    Returns:
+        "Positive" if the sentiment is positive, "Negative" otherwise (neutral is considered negative).
+    """
     sia = SentimentIntensityAnalyzer()
     sentiment_scores = sia.polarity_scores(comment_text)
 
@@ -364,12 +427,18 @@ load_events_from_file()
 
 @app.get("/ping")
 def ping():
+    """Health check endpoint to verify server is running."""
     return {"message": "Server is active"}
 
 
 @app.get("/health")
 async def health_check():
-    """Check server health status."""
+    """
+    Endpoint to check the health status of the server and system metrics.
+
+    Returns:
+        A dictionary containing server status, timestamp, uptime, and system metrics.
+    """
     uptime_seconds = int(time.time() - START_TIME)
     system_stats = {
         "cpu_usage": psutil.cpu_percent(),
@@ -385,7 +454,16 @@ async def health_check():
 
 
 async def verify_webhook_signature(request: Request, raw_body: bytes) -> bool:
-    """Verify that the webhook request is from Meta."""
+    """
+    Verify that the webhook request is indeed from Meta by checking the signature.
+
+    Args:
+        request: FastAPI Request object containing headers.
+        raw_body: Raw request body as bytes.
+
+    Returns:
+        True if the signature is valid, False otherwise.
+    """
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not signature or not signature.startswith("sha256="):
         logger.error("Signature is missing or not properly formatted")
@@ -406,32 +484,63 @@ async def verify_webhook_signature(request: Request, raw_body: bytes) -> bool:
 
 @app.get("/webhook")
 async def verify_webhook(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge: str = Query(None, alias="hub.challenge")
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge")
 ):
-    """Verify webhook from Meta."""
-    logger.info(f"Received verification request: {hub_mode}, {hub_verify_token}")
+    """
+    Webhook verification endpoint for Meta.
+
+    This endpoint is called by Meta to verify the webhook subscription.
+    It checks the 'hub.mode', 'hub.verify_token', and returns 'hub.challenge' if verification is successful.
+
+    Args:
+        hub_mode: The mode of the webhook request (should be 'subscribe').
+        hub_verify_token: The verify token sent by Meta.
+        hub_challenge: The challenge string sent by Meta for verification.
+
+    Returns:
+        Response with the hub_challenge as plain text if verification is successful.
+
+    Raises:
+        HTTPException: 403 Forbidden if verification fails.
+    """
+    logger.info(f"Received verification request: hub_mode={hub_mode}, hub_verify_token={hub_verify_token}")
 
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         logger.info("Webhook verification successful")
-        return Response(content=hub_challenge, media_type="text/html")
+        return Response(content=hub_challenge, media_type="text/html")  # Respond with challenge
 
     logger.error("Webhook verification failed")
-    raise HTTPException(status_code=403, detail="Verification failed")
+    raise HTTPException(status_code=403, detail="Verification failed")  # Verification failed
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Handle incoming webhook events from Meta."""
-    raw_body = await request.body()
+    """
+    Main webhook endpoint to handle incoming webhook events from Meta.
+
+    This endpoint receives real-time updates from Instagram (Direct Messages, Comments, etc.).
+    It verifies the request signature, parses the event, and then processes it accordingly,
+    queuing tasks for response generation using Celery.
+
+    Args:
+        request: FastAPI Request object containing headers and body.
+
+    Returns:
+        A dictionary indicating success and the parsed events.
+
+    Raises:
+        HTTPException: 400 Bad Request if JSON payload is invalid, 403 Forbidden if signature is invalid.
+    """
+    raw_body = await request.body() # Get raw request body as bytes
     logger.info(f"Received raw webhook payload: {raw_body.decode('utf-8')}")
 
-    if not await verify_webhook_signature(request, raw_body):
-        raise HTTPException(status_code=403, detail="Invalid signature")
+    if not await verify_webhook_signature(request, raw_body): # Verify webhook signature
+        raise HTTPException(status_code=403, detail="Invalid signature") # Signature verification failed
 
     try:
-        payload = json.loads(raw_body)
+        payload = json.loads(raw_body) # Parse JSON payload
         event_with_time = {
             "timestamp": datetime.now().isoformat(),
             "payload": payload
@@ -446,22 +555,22 @@ async def webhook(request: Request):
             # Handle different types of events
             if event["type"] == "direct_message" and event["is_echo"] == False:
                 conversation_id = str(event["sender_id"]) + "_" + str(event["recipient_id"])
-                account_id_to_use = str(event["recipient_id"]) # MODIFIED: Use recipient_id as account_id
+                account_id_to_use = str(event["recipient_id"])  # Use recipient_id as account_id
 
                 if conversation_id not in message_queue:
                     # New conversation
-                    message_queue[conversation_id] = [event]
+                    message_queue[conversation_id] = [event] # Initialize message queue for conversation
                     delay = random.randint(1 * 60, 2 * 60)  # Initial delay (1-2 minutes)
                     task = send_dm.apply_async(
-                        args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
-                        countdown=delay, expires=delay +3600
+                        args=(conversation_id, message_queue.copy(), account_id_to_use),  # Pass account_id
+                        countdown=delay, expires=delay + 3600 # Task expires after 1 hour + delay
                     )
                     conversation_task_schedules[conversation_id] = task.id  # Track scheduled task ID
                     logger.info(f"Scheduled initial DM task for new conversation: {conversation_id}, task_id: {task.id}, delay: {delay}s, account_id: {account_id_to_use}")
 
                 else:
                     # Existing conversation - add new message and re-schedule
-                    message_queue[conversation_id].append(event)
+                    message_queue[conversation_id].append(event) # Append new message to existing conversation queue
                     logger.info(f"Added message to existing conversation: {conversation_id}")
 
                     # Re-schedule send_dm task with a shorter delay upon new message
@@ -472,95 +581,122 @@ async def webhook(request: Request):
 
                         new_delay = 30  # Shorter delay for re-scheduling (e.g., 30 seconds)
                         new_task = send_dm.apply_async(
-                            args=(conversation_id, message_queue.copy(), account_id_to_use),  # MODIFIED: Pass account_id
-                            countdown=new_delay, expires=new_delay + 3600
+                            args=(conversation_id, message_queue.copy(), account_id_to_use),  # Pass account_id
+                            countdown=new_delay, expires=new_delay + 3600 # Task expires after 1 hour + new delay
                         )
                         conversation_task_schedules[conversation_id] = new_task.id  # Track new task ID
                         logger.info(f"Re-scheduled DM task for conversation: {conversation_id}, task_id: {new_task.id}, new delay: {new_delay}s (due to new message), account_id: {account_id_to_use}")
 
 
-            elif event["type"] == "comment": # Removed the ACCOUNT_CREDENTIALS check from here
-                if event["to_id"] in ACCOUNT_CREDENTIALS: # Check inside now
+            elif event["type"] == "comment":  # Handle comment events
+                if event["to_id"] in ACCOUNT_CREDENTIALS:  # Check if comment is for a configured account
                     # Analyze sentiment of the comment
-                    if event["from_id"] == event["to_id"]:
+                    if event["from_id"] == event["to_id"]: # Ignore comments from the same account
                         logger.info(f"Comment received from the same account ID: {event['from_id']}. Ignoring.")
-                        break
+                        break  # Skip processing comment from same account
 
                     else:
-                        sentiment = analyze_sentiment(event["text"])
+                        sentiment = analyze_sentiment(event["text"]) # Analyze comment sentiment
                         if sentiment == "Positive":
                             message_to_be_sent = default_comment_response_positive
                         else:
                             message_to_be_sent = default_comment_response_negative
 
-                        account_id_to_use = event["to_id"]# Default account ID for comments, can be adjusted as needed
+                        account_id_to_use = event["to_id"]  # Use comment's 'to_id' as account_id
                         # Schedule the reply task
-                        delay = random.randint(1 * 60, 2* 60)  # 10 to 25 minutes in seconds
+                        delay = random.randint(1 * 60, 2 * 60)  # 1 to 2 minutes delay for comment reply
                         send_delayed_reply.apply_async(
-                            args=(event["comment_id"], message_to_be_sent, account_id_to_use), # MODIFIED: Pass account_id
-                            countdown=delay, expires=delay + 600
+                            args=(event["comment_id"], message_to_be_sent, account_id_to_use),  # Pass account_id
+                            countdown=delay, expires=delay + 600 # Task expires after 10 minutes + delay
                         )
                         logger.info(f"Scheduled reply task for comment {event['comment_id']} in {delay} seconds using account {account_id_to_use}")
                 else:
                     logger.warning(f"Comment received for unconfigured account ID: {event['to_id']}. Ignoring.")
-                    # Optionally, you could send a default "we don't handle comments for this page" response or just ignore.
+                    # Optionally, handle comments for unconfigured accounts differently
 
         # Store event and notify clients
-        WEBHOOK_EVENTS.append(event_with_time)
-        save_events_to_file()
+        WEBHOOK_EVENTS.append(event_with_time) # Add event to deque
+        save_events_to_file() # Save events to file
 
         # Notify connected SSE clients
         for client_queue in CLIENTS:
-            await client_queue.put(event_with_time)
+            await client_queue.put(event_with_time) # Put event into each client queue
 
-        return {"success": True, "parsed_events": parsed_events}
+        return {"success": True, "parsed_events": parsed_events} # Return success and parsed events
 
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") # Invalid JSON payload
 
 
 @app.get("/webhook_events")
 async def get_webhook_events():
-    """Retrieve all stored webhook events."""
+    """
+    Endpoint to retrieve all stored webhook events.
+
+    Returns:
+        A dictionary containing a list of stored webhook events.
+    """
     return {"events": list(WEBHOOK_EVENTS)}
 
 
 async def event_generator(request: Request):
-    """Generate Server-Sent Events."""
-    client_queue = asyncio.Queue()
-    CLIENTS.append(client_queue)
+    """
+    Asynchronous generator for Server-Sent Events (SSE).
+
+    This generator sends stored webhook events to newly connected clients and then
+    listens for new events to broadcast in real-time. It also sends keep-alive messages
+    to prevent connection timeouts.
+
+    Args:
+        request: FastAPI Request object to check for client disconnection.
+
+    Yields:
+        SSE 'data:' messages containing JSON-serialized webhook events.
+    """
+    client_queue: asyncio.Queue = asyncio.Queue() # Create a queue for this client
+    CLIENTS.append(client_queue) # Add client queue to the global list
 
     try:
-        # Send existing events
+        # Send existing events to the newly connected client
         for event in WEBHOOK_EVENTS:
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {json.dumps(event)}\n\n" # Yield existing events as SSE data
 
-        # Listen for new events
-        while not await request.is_disconnected():
+        # Listen for new events and send to client
+        while not await request.is_disconnected(): # Check if client is still connected
             try:
-                event = await asyncio.wait_for(client_queue.get(), timeout=30)
-                yield f"data: {json.dumps(event)}\n\n"
+                event = await asyncio.wait_for(client_queue.get(), timeout=30) # Wait for new event (with timeout)
+                yield f"data: {json.dumps(event)}\n\n" # Yield new event as SSE data
             except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
+                yield ": keepalive\n\n" # Send keepalive message to prevent timeout
 
     finally:
-        CLIENTS.remove(client_queue)
+        CLIENTS.remove(client_queue) # Remove client queue when client disconnects
 
 
 @app.get("/events")
 async def events(request: Request):
-    """SSE endpoint for real-time webhook events."""
-    return EventSourceResponse(event_generator(request))
+    """
+    SSE endpoint for real-time webhook events.
+
+    This endpoint establishes a Server-Sent Events connection and uses the event_generator
+    to stream webhook events to the client in real-time.
+
+    Args:
+        request: FastAPI Request object.
+
+    Returns:
+        EventSourceResponse that streams events using the event_generator.
+    """
+    return EventSourceResponse(event_generator(request)) # Return SSE response using event generator
 
 
-# Serve static HTML
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# Removed: Serve static HTML and mount - Static file serving is no longer used
+# app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # --- MODIFICATION: Celery task check on startup ---
-
 # --------------------------------------------------
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) # Run the FastAPI application

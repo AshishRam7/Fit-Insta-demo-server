@@ -1,10 +1,11 @@
 fastapi
-sse-starlette==0.3.2
 uvicorn
-psutil
-python-dotenv
 requests
+pydantic
+python-dotenv
+celery
+redis  # If you decide to use Redis as broker/backend later
+sse-starlette
 nltk
-celery[redis]
-redis          
-sqlalchemy
+psutil
+pydantic-settings
